@@ -45,7 +45,7 @@ async function fixData() {
   } else {
     const slugPlaceholder = `loja-${Date.now().toString().slice(-4)}`
     const { data: newStore, error: storeError } = await admin.from('stores').insert({
-      name: 'AutoAgente Dealer',
+      name: 'CarGrow Dealer',
       slug: slugPlaceholder,
       plan: 'pro',
       onboarding_completo: true,

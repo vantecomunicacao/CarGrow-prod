@@ -1,6 +1,8 @@
 import 'dotenv/config'
-import express from 'express'
-import cors from 'cors'
+import express, { type Request, type Response } from 'express'
+import cors, { type CorsOptions } from 'cors'
+import helmet from 'helmet'
+import rateLimit from 'express-rate-limit'
 import { enqueueMessage, enqueueMedia } from './agent'
 import { isBotSentMessage, markAsRead, sendReply, sendPresenceOnce } from './evolution'
 import { streamLogsToClient } from './logger'
@@ -9,6 +11,8 @@ import { supabase } from './db'
 import { addKnowledge, deleteKnowledge, listKnowledge } from './rag'
 import { runFollowUpCycle } from './followup'
 import { safeDecrypt } from './crypto'
+import { requireAuth, requireSseTicket, requireWebhookSecret } from './auth/middleware'
+import { signTicket } from './auth/sseTicket'
 
 // ── Tratamento Global de Erros ───────────────────────────────────────────────
 // Evita que o processo morra em caso de exceções não tratadas em tarefas de fundo
@@ -26,8 +30,49 @@ async function getInstanceName(storeId: string): Promise<string> {
 }
 
 const app = express()
-app.use(cors())
+
+const allowedOrigins = (process.env.ALLOWED_ORIGINS ?? '')
+  .split(',')
+  .map(s => s.trim())
+  .filter(Boolean)
+
+const corsOptions: CorsOptions = {
+  origin(origin, cb) {
+    // Requests sem origin (curl, server-side, webhooks) são permitidos —
+    // a autenticação por rota cuida deles.
+    if (!origin) return cb(null, true)
+    if (allowedOrigins.length === 0) return cb(null, true)
+    if (allowedOrigins.includes(origin)) return cb(null, true)
+    cb(new Error(`CORS: origin ${origin} não permitida`))
+  },
+  credentials: false,
+}
+
+app.use(helmet())
+app.use(cors(corsOptions))
 app.use(express.json({ limit: '50mb' }))
+
+const adminLimiter = rateLimit({
+  windowMs: 60_000,
+  limit: 60,
+  standardHeaders: 'draft-7',
+  legacyHeaders: false,
+  message: { error: 'too_many_requests' },
+})
+
+const webhookLimiter = rateLimit({
+  windowMs: 60_000,
+  limit: 600,
+  standardHeaders: 'draft-7',
+  legacyHeaders: false,
+  message: { error: 'too_many_requests' },
+})
+
+app.use('/webhook', webhookLimiter)
+app.use('/whatsapp', adminLimiter)
+app.use('/knowledge', adminLimiter)
+app.use('/logs', adminLimiter)
+app.use('/auth', adminLimiter)
 
 const PORT = process.env.AGENT_PORT ?? 3001
 
@@ -40,7 +85,7 @@ app.get('/health', (_req, res) => {
 const unsupportedHandled = new Set<string>()
 
 // ── Webhook Evolution API ─────────────────────────────────────────────────────
-app.post('/webhook', (req, res) => {
+function handleEvolutionWebhook(req: Request, res: Response): void {
   res.sendStatus(200)
 
   const body = req.body
@@ -163,14 +208,39 @@ app.post('/webhook', (req, res) => {
       })().catch(() => { /* não crítico */ })
     }
   }
+}
+
+// Rota nova com secret no path. Configurar Evolution API para apontar para esta URL.
+app.post('/webhook/:secret', requireWebhookSecret, handleEvolutionWebhook)
+
+// Rota legacy sem secret. Mantida por 1 release para transição.
+// Remover após confirmar que a Evolution está apontando para /webhook/:secret.
+app.post('/webhook', (req, res) => {
+  console.warn('[deprecated] POST /webhook sem secret — atualize a Evolution API para /webhook/<secret>')
+  handleEvolutionWebhook(req, res)
 })
 
+function buildWebhookUrl(): string {
+  const base = process.env.PUBLIC_URL ?? `http://localhost:${PORT}`
+  const secret = process.env.EVOLUTION_WEBHOOK_SECRET
+  if (!secret) {
+    throw new Error('EVOLUTION_WEBHOOK_SECRET não configurado — não é possível registrar webhook')
+  }
+  return `${base}/webhook/${secret}`
+}
+
+// `req.storeId` é setado por `requireAuth` (do JWT). Em shadow mode, pode ser
+// undefined — caímos para `req.query.store_id` para não quebrar callers legacy.
+function resolveStoreId(req: Request): string | undefined {
+  return req.storeId ?? (typeof req.query.store_id === 'string' ? req.query.store_id : undefined)
+}
+
 // ── WhatsApp ──────────────────────────────────────────────────────────────────
-app.get('/whatsapp/qr', async (req, res) => {
-  const storeId = req.query.store_id as string
+app.get('/whatsapp/qr', requireAuth, async (req, res) => {
+  const storeId = resolveStoreId(req)
   if (!storeId) { res.sendStatus(400); return }
   try {
-    const webhookUrl = `${process.env.PUBLIC_URL ?? `http://localhost:${PORT}`}/webhook`
+    const webhookUrl = buildWebhookUrl()
     const instance = await getInstanceName(storeId)
     const data = await createOrGetQR(instance, webhookUrl)
     await supabase.from('stores').update({ whatsapp_instance: instance }).eq('id', storeId)
@@ -182,15 +252,15 @@ app.get('/whatsapp/qr', async (req, res) => {
 
 // ── WhatsApp TESTE (instância separada, webhook local) ────────────────────────
 // Usa store_<id>_test como nome de instância e aponta o webhook para localhost
-app.get('/whatsapp/qr-test', async (req, res) => {
-  const storeId = req.query.store_id as string
+app.get('/whatsapp/qr-test', requireAuth, async (req, res) => {
+  const storeId = resolveStoreId(req)
   if (!storeId) { res.sendStatus(400); return }
   if (!process.env.PUBLIC_URL) {
     res.status(400).json({ error: 'Configure PUBLIC_URL no agente/.env com a URL do ngrok antes de usar o WhatsApp Teste.' })
     return
   }
   try {
-    const webhookUrl = `${process.env.PUBLIC_URL}/webhook`
+    const webhookUrl = buildWebhookUrl()
     const instance = `${await getInstanceName(storeId)}_test`
     const data = await createOrGetQR(instance, webhookUrl)
     res.json(data)
@@ -199,8 +269,8 @@ app.get('/whatsapp/qr-test', async (req, res) => {
   }
 })
 
-app.get('/whatsapp/status-test', async (req, res) => {
-  const storeId = req.query.store_id as string
+app.get('/whatsapp/status-test', requireAuth, async (req, res) => {
+  const storeId = resolveStoreId(req)
   if (!storeId) { res.sendStatus(400); return }
   try {
     const instance = `${await getInstanceName(storeId)}_test`
@@ -210,8 +280,8 @@ app.get('/whatsapp/status-test', async (req, res) => {
   }
 })
 
-app.delete('/whatsapp/disconnect-test', async (req, res) => {
-  const storeId = req.query.store_id as string
+app.delete('/whatsapp/disconnect-test', requireAuth, async (req, res) => {
+  const storeId = resolveStoreId(req)
   if (!storeId) { res.sendStatus(400); return }
   try {
     const instance = `${await getInstanceName(storeId)}_test`
@@ -222,8 +292,8 @@ app.delete('/whatsapp/disconnect-test', async (req, res) => {
   }
 })
 
-app.get('/whatsapp/status', async (req, res) => {
-  const storeId = req.query.store_id as string
+app.get('/whatsapp/status', requireAuth, async (req, res) => {
+  const storeId = resolveStoreId(req)
   if (!storeId) { res.sendStatus(400); return }
   try {
     res.json(await checkStatus(await getInstanceName(storeId)))
@@ -232,8 +302,8 @@ app.get('/whatsapp/status', async (req, res) => {
   }
 })
 
-app.delete('/whatsapp/disconnect', async (req, res) => {
-  const storeId = req.query.store_id as string
+app.delete('/whatsapp/disconnect', requireAuth, async (req, res) => {
+  const storeId = resolveStoreId(req)
   if (!storeId) { res.sendStatus(400); return }
   try {
     await disconnectInstance(await getInstanceName(storeId))
@@ -245,8 +315,8 @@ app.delete('/whatsapp/disconnect', async (req, res) => {
 })
 
 // ── Base de conhecimento ──────────────────────────────────────────────────────
-app.get('/knowledge', async (req, res) => {
-  const storeId = req.query.store_id as string
+app.get('/knowledge', requireAuth, async (req, res) => {
+  const storeId = resolveStoreId(req)
   if (!storeId) { res.sendStatus(400); return }
   try {
     res.json(await listKnowledge(storeId))
@@ -255,27 +325,38 @@ app.get('/knowledge', async (req, res) => {
   }
 })
 
-app.post('/knowledge', async (req, res) => {
-  const { store_id, title, content } = req.body as { store_id: string; title: string; content: string }
-  if (!store_id || !content) { res.sendStatus(400); return }
+app.post('/knowledge', requireAuth, async (req, res) => {
+  const storeId = resolveStoreId(req) ?? (req.body as { store_id?: string }).store_id
+  const { title, content } = req.body as { title: string; content: string }
+  if (!storeId || !content) { res.sendStatus(400); return }
 
   // Busca a API key da loja
-  const { data: store } = await supabase.from('stores').select('openai_api_key').eq('id', store_id).single()
+  const { data: store } = await supabase.from('stores').select('openai_api_key').eq('id', storeId).single()
   if (!store?.openai_api_key) {
     res.status(400).json({ error: 'Configure a API key OpenAI antes de adicionar conhecimento.' })
     return
   }
 
   try {
-    await addKnowledge(store_id, title, content, safeDecrypt(store.openai_api_key))
+    await addKnowledge(storeId, title, content, safeDecrypt(store.openai_api_key))
     res.json({ ok: true })
   } catch (err) {
     res.status(500).json({ error: err instanceof Error ? err.message : String(err) })
   }
 })
 
-app.delete('/knowledge/:id', async (req, res) => {
+app.delete('/knowledge/:id', requireAuth, async (req, res) => {
   try {
+    // Verifica que o knowledge pertence à loja do usuário (anti-IDOR cross-tenant).
+    const storeId = resolveStoreId(req)
+    if (storeId && !req.isMaster) {
+      const { data: row } = await supabase
+        .from('knowledge_base').select('store_id').eq('id', req.params.id).single()
+      if (row && row.store_id !== storeId) {
+        res.sendStatus(404)
+        return
+      }
+    }
     await deleteKnowledge(req.params.id)
     res.json({ ok: true })
   } catch (err) {
@@ -283,17 +364,9 @@ app.delete('/knowledge/:id', async (req, res) => {
   }
 })
 
-// ── Lead: toggle ai_active ────────────────────────────────────────────────────
-app.patch('/leads/:id/ai', async (req, res) => {
-  const { ai_active } = req.body as { ai_active: boolean }
-  const { error } = await supabase.from('leads').update({ ai_active }).eq('id', req.params.id)
-  if (error) { res.status(500).json({ error: error.message }); return }
-  res.json({ ok: true })
-})
-
 // ── Logs: histórico paginado ──────────────────────────────────────────────────
-app.get('/logs', async (req, res) => {
-  const storeId = req.query.store_id as string
+app.get('/logs', requireAuth, async (req, res) => {
+  const storeId = resolveStoreId(req)
   const limit = Number(req.query.limit ?? 100)
   if (!storeId) { res.sendStatus(400); return }
 
@@ -307,9 +380,17 @@ app.get('/logs', async (req, res) => {
   res.json(data ?? [])
 })
 
-// ── SSE: stream de logs em tempo real ─────────────────────────────────────────
-app.get('/logs/stream', (req, res) => {
-  const storeId = req.query.store_id as string
+// ── SSE ticket: troca um Bearer por um ticket curto que o EventSource passa em query ───
+app.post('/auth/sse-ticket', requireAuth, (req, res) => {
+  const storeId = req.storeId
+  if (!storeId) { res.status(400).json({ error: 'no-store-id' }); return }
+  const ticket = signTicket(storeId, !!req.isMaster)
+  res.json({ ticket })
+})
+
+// ── SSE: stream de logs em tempo real (autenticado via ticket em query) ───────
+app.get('/logs/stream', requireSseTicket, (req, res) => {
+  const storeId = req.storeId ?? (typeof req.query.store_id === 'string' ? req.query.store_id : undefined)
   if (!storeId) { res.sendStatus(400); return }
   streamLogsToClient(storeId, res)
 })

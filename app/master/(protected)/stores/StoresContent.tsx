@@ -1,7 +1,7 @@
 'use client'
 
 import { useState, useRef } from 'react'
-import { Search, ChevronDown, Plus } from 'lucide-react'
+import { Search, ChevronDown, Plus, Trash2, AlertTriangle } from 'lucide-react'
 import { useRouter } from 'next/navigation'
 
 type Store = {
@@ -62,9 +62,14 @@ export default function StoresContent({ stores }: { stores: Store[] }) {
   const [selectedPlan, setSelectedPlan] = useState('')
   const dialogRef = useRef<HTMLDialogElement>(null)
   const newAccountDialogRef = useRef<HTMLDialogElement>(null)
+  const deleteDialogRef = useRef<HTMLDialogElement>(null)
   const [newAccountForm, setNewAccountForm] = useState<NewAccountForm>(emptyForm)
   const [newAccountLoading, setNewAccountLoading] = useState(false)
   const [newAccountError, setNewAccountError] = useState('')
+  const [deletingStore, setDeletingStore] = useState<Store | null>(null)
+  const [deleteConfirmText, setDeleteConfirmText] = useState('')
+  const [deleteLoading, setDeleteLoading] = useState(false)
+  const [deleteError, setDeleteError] = useState('')
 
   const filtered = storeList.filter(
     (s) =>
@@ -113,6 +118,39 @@ export default function StoresContent({ stores }: { stores: Store[] }) {
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ is_active: newValue }),
     })
+  }
+
+  function openDeleteDialog(store: Store) {
+    setDeletingStore(store)
+    setDeleteConfirmText('')
+    setDeleteError('')
+    deleteDialogRef.current?.showModal()
+  }
+
+  function closeDeleteDialog() {
+    deleteDialogRef.current?.close()
+    setDeletingStore(null)
+    setDeleteConfirmText('')
+    setDeleteError('')
+  }
+
+  async function handleDeleteStore() {
+    if (!deletingStore) return
+    setDeleteLoading(true)
+    setDeleteError('')
+    try {
+      const res = await fetch(`/api/master/stores/${deletingStore.id}`, { method: 'DELETE' })
+      const data = await res.json().catch(() => ({}))
+      if (!res.ok) {
+        setDeleteError(data.error ?? 'Erro ao apagar conta.')
+        return
+      }
+      setStoreList((prev) => prev.filter((s) => s.id !== deletingStore.id))
+      closeDeleteDialog()
+      router.refresh()
+    } finally {
+      setDeleteLoading(false)
+    }
   }
 
   async function handleNewAccount(e: React.FormEvent) {
@@ -199,12 +237,21 @@ export default function StoresContent({ stores }: { stores: Store[] }) {
                     {new Date(store.created_at).toLocaleDateString('pt-BR')}
                   </td>
                   <td className="px-5 py-3">
-                    <button
-                      onClick={() => openPlanDialog(store)}
-                      className="inline-flex items-center gap-1 text-xs text-slate-600 hover:text-slate-900 border border-gray-200 rounded-lg px-2.5 py-1.5 hover:bg-gray-50 transition-colors"
-                    >
-                      Alterar plano <ChevronDown size={12} />
-                    </button>
+                    <div className="flex items-center gap-1.5">
+                      <button
+                        onClick={() => openPlanDialog(store)}
+                        className="inline-flex items-center gap-1 text-xs text-slate-600 hover:text-slate-900 border border-gray-200 rounded-lg px-2.5 py-1.5 hover:bg-gray-50 transition-colors"
+                      >
+                        Alterar plano <ChevronDown size={12} />
+                      </button>
+                      <button
+                        onClick={() => openDeleteDialog(store)}
+                        className="p-1.5 rounded-lg text-gray-400 hover:text-red-600 hover:bg-red-50 transition-colors"
+                        title="Apagar conta"
+                      >
+                        <Trash2 size={14} />
+                      </button>
+                    </div>
                   </td>
                 </tr>
               ))}
@@ -394,6 +441,76 @@ export default function StoresContent({ stores }: { stores: Store[] }) {
             </div>
           </div>
         </form>
+      </dialog>
+
+      {/* Delete confirm dialog */}
+      <dialog
+        ref={deleteDialogRef}
+        className="rounded-xl border border-gray-200 shadow-xl p-0 w-full max-w-md backdrop:bg-black/40"
+      >
+        <div className="p-5">
+          <div className="flex items-start gap-3 mb-4">
+            <div className="shrink-0 w-9 h-9 rounded-full bg-red-100 text-red-600 flex items-center justify-center">
+              <AlertTriangle size={18} />
+            </div>
+            <div>
+              <h3 className="text-base font-semibold text-gray-900">Apagar conta</h3>
+              <p className="text-sm text-gray-500 mt-0.5">Esta ação é permanente e não pode ser desfeita.</p>
+            </div>
+          </div>
+
+          {deletingStore && (
+            <div className="rounded-lg border border-gray-200 bg-gray-50 px-3 py-2.5 mb-4">
+              <p className="text-sm font-medium text-gray-900">{deletingStore.name}</p>
+              <p className="text-xs text-gray-500 font-mono mt-0.5">{deletingStore.slug}</p>
+            </div>
+          )}
+
+          <div className="rounded-lg border border-red-200 bg-red-50 px-3 py-2.5 mb-4 text-xs text-red-700">
+            <p className="font-medium mb-1">Tudo abaixo será apagado:</p>
+            <ul className="list-disc pl-4 space-y-0.5">
+              <li>{deletingStore?.vehicleCount ?? 0} veículo(s) e suas fotos</li>
+              <li>{deletingStore?.leadCount ?? 0} lead(s) e conversas do agente</li>
+              <li>Logo, banner e demais arquivos da loja</li>
+              <li>Usuários vinculados apenas a esta loja</li>
+            </ul>
+          </div>
+
+          <label className="block text-xs font-medium text-gray-700 mb-1">
+            Para confirmar, digite o nome da loja: <strong>{deletingStore?.name}</strong>
+          </label>
+          <input
+            type="text"
+            value={deleteConfirmText}
+            onChange={(e) => setDeleteConfirmText(e.target.value)}
+            className="w-full h-9 px-3 border border-gray-200 rounded-lg text-sm focus:outline-none focus:ring-2 focus:ring-red-300"
+            placeholder={deletingStore?.name ?? ''}
+            autoComplete="off"
+          />
+
+          {deleteError && (
+            <p className="mt-3 text-xs text-red-600 bg-red-50 border border-red-200 rounded-lg px-3 py-2">
+              {deleteError}
+            </p>
+          )}
+
+          <div className="flex gap-2 mt-5">
+            <button
+              onClick={closeDeleteDialog}
+              disabled={deleteLoading}
+              className="flex-1 h-9 text-sm border border-gray-200 rounded-lg hover:bg-gray-50 disabled:opacity-50 transition-colors"
+            >
+              Cancelar
+            </button>
+            <button
+              onClick={handleDeleteStore}
+              disabled={deleteLoading || deleteConfirmText !== deletingStore?.name}
+              className="flex-1 h-9 text-sm bg-red-600 text-white rounded-lg hover:bg-red-700 disabled:opacity-50 disabled:cursor-not-allowed transition-colors"
+            >
+              {deleteLoading ? 'Apagando...' : 'Apagar conta'}
+            </button>
+          </div>
+        </div>
       </dialog>
     </>
   )

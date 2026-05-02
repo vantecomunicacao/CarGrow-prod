@@ -3,8 +3,7 @@
 import { useState, useEffect, useCallback } from 'react'
 import { Button } from '@/components/ui/button'
 import { Loader2, Smartphone, CheckCircle2, XCircle, RefreshCw } from 'lucide-react'
-
-const AGENT_URL = process.env.NEXT_PUBLIC_AGENT_URL ?? 'http://localhost:3001'
+import { fetchAgent } from '@/lib/agent/fetchAgent'
 
 interface Props {
   storeId: string
@@ -12,7 +11,7 @@ interface Props {
 
 type Status = 'idle' | 'loading' | 'qr' | 'connected' | 'error'
 
-function useWhatsAppInstance(storeId: string, mode: 'main' | 'test') {
+function useWhatsAppInstance(_storeId: string, mode: 'main' | 'test') {
   const [status, setStatus] = useState<Status>('idle')
   const [qr, setQr] = useState<string | null>(null)
   const [polling, setPolling] = useState(false)
@@ -23,7 +22,7 @@ function useWhatsAppInstance(storeId: string, mode: 'main' | 'test') {
 
   const checkConnection = useCallback(async () => {
     try {
-      const res = await fetch(`${AGENT_URL}/whatsapp/${statusEndpoint}?store_id=${storeId}`)
+      const res = await fetchAgent(`/whatsapp/${statusEndpoint}`)
       const data = await res.json() as { connected?: boolean }
       if (data.connected) {
         setStatus('connected')
@@ -32,7 +31,7 @@ function useWhatsAppInstance(storeId: string, mode: 'main' | 'test') {
     } catch {
       // silencioso
     }
-  }, [storeId, statusEndpoint])
+  }, [statusEndpoint])
 
   useEffect(() => {
     if (!polling) return
@@ -48,7 +47,7 @@ function useWhatsAppInstance(storeId: string, mode: 'main' | 'test') {
     setStatus('loading')
     setQr(null)
     try {
-      const res = await fetch(`${AGENT_URL}/whatsapp/${qrEndpoint}?store_id=${storeId}`)
+      const res = await fetchAgent(`/whatsapp/${qrEndpoint}`)
       const data = await res.json() as { connected?: boolean; qr?: string; qrcode?: string }
       if (data.connected) { setStatus('connected'); return }
       const qrCode = data.qr ?? data.qrcode
@@ -63,7 +62,7 @@ function useWhatsAppInstance(storeId: string, mode: 'main' | 'test') {
     setStatus('loading')
     setPolling(false)
     try {
-      await fetch(`${AGENT_URL}/whatsapp/${disconnectEndpoint}?store_id=${storeId}`, { method: 'DELETE' })
+      await fetchAgent(`/whatsapp/${disconnectEndpoint}`, { method: 'DELETE' })
       setStatus('idle')
       setQr(null)
     } catch {

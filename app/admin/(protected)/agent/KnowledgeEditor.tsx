@@ -7,8 +7,7 @@ import { Textarea } from '@/components/ui/textarea'
 import { Label } from '@/components/ui/label'
 import { toast } from 'sonner'
 import { Loader2, Plus, Trash2, BookOpen } from 'lucide-react'
-
-const AGENT_URL = process.env.NEXT_PUBLIC_AGENT_URL ?? 'http://localhost:3001'
+import { fetchAgent } from '@/lib/agent/fetchAgent'
 
 interface KnowledgeItem {
   id: string
@@ -26,7 +25,7 @@ export function KnowledgeEditor({ storeId }: { storeId: string }) {
   async function load() {
     setLoading(true)
     try {
-      const res = await fetch(`${AGENT_URL}/knowledge?store_id=${storeId}`)
+      const res = await fetchAgent('/knowledge')
       const data = await res.json() as KnowledgeItem[]
       setItems(Array.isArray(data) ? data : [])
     } catch {
@@ -42,10 +41,10 @@ export function KnowledgeEditor({ storeId }: { storeId: string }) {
     if (!form.content.trim()) { toast.error('O conteúdo não pode estar vazio.'); return }
     setSaving(true)
     try {
-      const res = await fetch(`${AGENT_URL}/knowledge`, {
+      const res = await fetchAgent('/knowledge', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ store_id: storeId, title: form.title, content: form.content }),
+        body: JSON.stringify({ title: form.title, content: form.content }),
       })
       if (!res.ok) {
         const err = await res.json() as { error?: string }
@@ -64,7 +63,7 @@ export function KnowledgeEditor({ storeId }: { storeId: string }) {
 
   async function handleDelete(id: string) {
     try {
-      await fetch(`${AGENT_URL}/knowledge/${id}`, { method: 'DELETE' })
+      await fetchAgent(`/knowledge/${id}`, { method: 'DELETE' })
       setItems(prev => prev.filter(i => i.id !== id))
       toast.success('Removido.')
     } catch {

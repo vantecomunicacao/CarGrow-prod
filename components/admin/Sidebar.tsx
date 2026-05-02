@@ -1,5 +1,6 @@
 'use client'
 
+import Image from 'next/image'
 import Link from 'next/link'
 import { usePathname } from 'next/navigation'
 import {
@@ -72,15 +73,17 @@ export function Sidebar({
     >
       {/* Logo */}
       <div
-        className="flex items-center gap-2.5 px-5 py-5"
+        className="flex items-center px-5 py-5"
         style={{ borderBottom: '0.5px solid rgba(255,255,255,0.07)' }}
       >
-        <div className="w-8 h-8 rounded-lg bg-ds-primary-600 flex items-center justify-center flex-shrink-0">
-          <span className="text-white font-semibold text-sm">A</span>
-        </div>
-        <span className="text-[15px] font-medium text-white">
-          Auto<span className="text-blue-400">Agente</span>
-        </span>
+        <Image
+          src="/brand/cargrow-logo-light.png"
+          alt="CarGrow"
+          width={1000}
+          height={200}
+          priority
+          className="h-7 w-auto"
+        />
       </div>
 
       {/* Store info */}

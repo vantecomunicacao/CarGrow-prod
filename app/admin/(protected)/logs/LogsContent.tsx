@@ -3,8 +3,7 @@
 import { useState, useEffect, useRef } from 'react'
 import { Loader2, CheckCircle2, XCircle, Radio, RefreshCw } from 'lucide-react'
 import { Button } from '@/components/ui/button'
-
-const AGENT_URL = process.env.NEXT_PUBLIC_AGENT_URL ?? 'http://localhost:3001'
+import { fetchAgent, getSseTicket, buildSseUrl } from '@/lib/agent/fetchAgent'
 
 interface LogEntry {
   id: string
@@ -70,7 +69,7 @@ export function LogsContent({ storeId }: { storeId: string }) {
   async function loadLogs() {
     setLoading(true)
     try {
-      const res = await fetch(`${AGENT_URL}/logs?store_id=${storeId}&limit=200`)
+      const res = await fetchAgent('/logs?limit=200')
       const data = await res.json() as LogEntry[]
       setLogs(data)
     } finally {
@@ -78,17 +77,30 @@ export function LogsContent({ storeId }: { storeId: string }) {
     }
   }
 
-  function startLive() {
+  async function startLive() {
     if (esRef.current) { esRef.current.close() }
-    const es = new EventSource(`${AGENT_URL}/logs/stream?store_id=${storeId}`)
-    es.onmessage = (e) => {
-      try {
-        const log = JSON.parse(e.data) as LogEntry
-        setLogs(prev => [log, ...prev].slice(0, 300))
-      } catch { /* ignorar */ }
+    try {
+      const ticket = await getSseTicket()
+      const es = new EventSource(buildSseUrl('/logs/stream', ticket))
+      es.onmessage = (e) => {
+        try {
+          const log = JSON.parse(e.data) as LogEntry
+          setLogs(prev => [log, ...prev].slice(0, 300))
+        } catch { /* ignorar */ }
+      }
+      es.onerror = () => {
+        // Ticket expira em 60s — reconectar com novo ticket.
+        es.close()
+        if (esRef.current === es) {
+          esRef.current = null
+          setLive(false)
+        }
+      }
+      esRef.current = es
+      setLive(true)
+    } catch {
+      setLive(false)
     }
-    esRef.current = es
-    setLive(true)
   }
 
   function stopLive() {

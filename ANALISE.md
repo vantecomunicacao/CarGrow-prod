@@ -1,4 +1,4 @@
-# Análise Técnica — VT Auto Sistema
+# Análise Técnica — CarGrow
 
 > Data: 2026-04-13
 
