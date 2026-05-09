@@ -13,6 +13,7 @@ import { runFollowUpCycle } from './followup'
 import { safeDecrypt } from './crypto'
 import { requireAuth, requireSseTicket, requireWebhookSecret } from './auth/middleware'
 import { signTicket } from './auth/sseTicket'
+import { runHealthchecks, dispatchAlert } from './healthcheck'
 import crypto from 'crypto'
 
 // ── Tratamento Global de Erros ───────────────────────────────────────────────
@@ -569,6 +570,39 @@ function requireCronSecret(req: Request, res: Response, next: () => void): void 
 app.post('/internal/cron/followup', requireCronSecret, (_req, res) => {
   res.sendStatus(202)
   runFollowUpCycle().catch(err => console.error('[cron/followup] erro:', err))
+})
+
+// ── Cron interno: healthcheck ────────────────────────────────────────────────
+// Disparado a cada 15 min pelo pg_cron. Roda os 5 checks server-side e, se
+// alguma coisa falhar, posta direto no n8n com payload detalhado.
+// Aceita ?force_fail=1 para validar o caminho de alerta sem precisar quebrar o sistema.
+app.post('/internal/healthcheck', requireCronSecret, async (req, res) => {
+  const forceFail = req.query.force_fail === '1'
+  try {
+    const report = await runHealthchecks()
+    if (forceFail) {
+      report.checks.push({
+        name: 'force_fail_test',
+        ok: false,
+        hint: 'Falha forçada via ?force_fail=1 — apenas teste de pipeline de alerta',
+      })
+      report.failed.push(report.checks[report.checks.length - 1])
+      report.ok = false
+    }
+    if (!report.ok) {
+      dispatchAlert(report).catch(err => console.error('[healthcheck] erro no dispatch:', err))
+      res.status(503).json({
+        status: 'down',
+        failed: report.failed.map(c => c.name),
+        checks: report.checks,
+      })
+      return
+    }
+    res.status(200).json({ status: 'up', checks_passed: report.checks.length })
+  } catch (err) {
+    console.error('[healthcheck] erro ao rodar checks:', err)
+    res.status(500).json({ error: 'healthcheck_internal_error' })
+  }
 })
 
 if (process.env.NODE_ENV !== 'test') {
