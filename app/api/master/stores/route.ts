@@ -1,6 +1,6 @@
 import { createClient, createAdminClient } from '@/lib/supabase/server'
 import { NextRequest } from 'next/server'
-import { buildAgentPrompt } from '@/lib/defaults/agentPrompt'
+import { DEFAULT_AGENT_PROMPT } from '@/lib/defaults/agentPrompt'
 
 async function verifyMaster() {
   const supabase = await createClient()
@@ -77,7 +77,7 @@ export async function POST(request: NextRequest) {
       phone: body.phone ?? null,
       email: body.email ?? null,
       is_active: true,
-      agent_prompt: buildAgentPrompt(body.store_name),
+      agent_prompt: DEFAULT_AGENT_PROMPT,
     })
     .select('id, name, slug, plan, is_active, created_at, city, state, phone')
     .single()

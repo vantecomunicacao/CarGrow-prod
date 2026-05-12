@@ -17,7 +17,7 @@ import { FollowUpConfig } from './FollowUpConfig'
 import { AgentHours } from './AgentHours'
 import { Salespeople } from './Salespeople'
 import { SummaryFieldsEditor } from './SummaryFieldsEditor'
-import { buildAgentPrompt } from '@/lib/defaults/agentPrompt'
+import { DEFAULT_AGENT_PROMPT } from '@/lib/defaults/agentPrompt'
 
 const PROMPT_VARIABLES: { token: string; description: string }[] = [
   { token: '{{STORE_NAME}}', description: 'Nome da loja' },
@@ -39,7 +39,6 @@ export function AgentContent({ storeId, followUpEnabled, followUpConfig, agentHo
   const [loading, setLoading] = useState(true)
   const [showKey, setShowKey] = useState(false)
   const [msgSizeMode, setMsgSizeMode] = useState<'small' | 'medium' | 'large' | 'custom'>('medium')
-  const [storeName, setStoreName] = useState('sua loja')
   const promptTextareaRef = useRef<HTMLTextAreaElement>(null)
 
   function insertPromptVariable(token: string) {
@@ -89,7 +88,6 @@ export function AgentContent({ storeId, followUpEnabled, followUpConfig, agentHo
             const chars: number = store.agent_max_message_chars ?? 300
             const mode = chars === 150 ? 'small' : chars === 300 ? 'medium' : chars === 500 ? 'large' : 'custom'
             setMsgSizeMode(mode as 'small' | 'medium' | 'large' | 'custom')
-            if (store.name) setStoreName(store.name)
             const loaded = {
               agent_active: store.agent_active ?? false,
               agent_name: store.agent_name ?? 'CarGrow',
@@ -123,7 +121,7 @@ export function AgentContent({ storeId, followUpEnabled, followUpConfig, agentHo
     if (!first) return
     const second = window.confirm('Esta ação vai apagar o prompt atual. Confirma?')
     if (!second) return
-    setForm(f => ({ ...f, agent_prompt: buildAgentPrompt(storeName) }))
+    setForm(f => ({ ...f, agent_prompt: DEFAULT_AGENT_PROMPT }))
     toast.info('Prompt redefinido para o modelo padrão. Salve para confirmar.')
   }
 

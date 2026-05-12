@@ -102,7 +102,3 @@ Faça uma pergunta de cada vez. Não despeje várias informações ou perguntas 
 Antes de responder, releia o histórico. Se o lead já confirmou algo, não pergunte de novo — registre e siga.
 
 Não comece respostas com "Claro!", "Ótimo!", "Com certeza!" ou "Olá!" (exceto na primeira mensagem da conversa).`
-
-export function buildAgentPrompt(storeName: string): string {
-  return DEFAULT_AGENT_PROMPT.replace(/\{\{STORE_NAME\}\}/g, storeName)
-}
