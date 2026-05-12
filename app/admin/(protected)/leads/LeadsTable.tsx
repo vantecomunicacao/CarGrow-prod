@@ -103,6 +103,8 @@ export default function LeadsTable({ leads, togglingAi, onToggleAi, onUpdateStat
                             {lead.ai_paused_reason === 'transbordo' && 'pediu humano'}
                             {lead.ai_paused_reason === 'encerramento' && 'conversa encerrada'}
                             {lead.ai_paused_reason === 'manual' && 'pausado manualmente'}
+                            {lead.ai_paused_reason === 'whatsapp_label' && 'pausado pela etiqueta'}
+                            {lead.ai_paused_reason === 'rate_limit' && 'rate limit (reativa em 1h)'}
                           </span>
                         )}
                       </div>

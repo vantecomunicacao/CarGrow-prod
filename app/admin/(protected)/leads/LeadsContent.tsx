@@ -16,7 +16,7 @@ export type Lead = {
   source: 'whatsapp' | 'vitrine' | 'manual' | string
   status: 'new' | 'qualifying' | 'negotiating' | 'closing' | 'converted' | 'lost' | string
   ai_active: boolean
-  ai_paused_reason: 'transbordo' | 'encerramento' | 'manual' | null
+  ai_paused_reason: 'transbordo' | 'encerramento' | 'manual' | 'whatsapp_label' | 'rate_limit' | null
   vehicle_interest: string | null
   budget: string | null
   payment_method: string | null
