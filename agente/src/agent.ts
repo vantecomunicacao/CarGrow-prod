@@ -103,6 +103,19 @@ interface IncomingMedia {
   caption?: string
 }
 
+export function applyPromptVariables(prompt: string, store: Record<string, unknown>): string {
+  const vars: Record<string, string> = {
+    STORE_NAME: (store.name as string) || 'sua loja',
+    LOJA_TELEFONE: (store.phone as string) || '',
+    LOJA_CIDADE: (store.city as string) || '',
+    LOJA_ESTADO: (store.state as string) || '',
+    AGENT_NAME: (store.agent_name as string) || '',
+  }
+  return prompt.replace(/\{\{(\w+)\}\}/g, (match, key) => {
+    return key in vars ? vars[key] : match
+  })
+}
+
 export function enqueueMessage(params: IncomingMessage): void {
   if (params.messageId) {
     // Chave única por instância + messageId (mesma mensagem pode chegar de instâncias diferentes)
@@ -255,7 +268,7 @@ export async function processMessage({ instance, phone, message, pushName }: Inc
   const t0 = Date.now()
   const { data: store, error: storeErr } = await supabase
     .from('stores')
-    .select('id, agent_active, agent_name, agent_tone, agent_prompt, agent_hours, openai_api_key, openai_model, whatsapp_instance, agent_cooldown_minutes, notification_phone, agent_context_window, agent_max_message_chars, agent_end_prompt, agent_stop_on_end, agent_typing_speed_ms, agent_rate_limit, bot_handoff_label_id, agent_summary_fields')
+    .select('id, name, phone, city, state, agent_active, agent_name, agent_tone, agent_prompt, agent_hours, openai_api_key, openai_model, whatsapp_instance, agent_cooldown_minutes, notification_phone, agent_context_window, agent_max_message_chars, agent_end_prompt, agent_stop_on_end, agent_typing_speed_ms, agent_rate_limit, bot_handoff_label_id, agent_summary_fields')
     .eq('whatsapp_instance', instance)
     .single()
 
@@ -273,7 +286,7 @@ export async function processMessage({ instance, phone, message, pushName }: Inc
   const t1 = Date.now()
   let { data: lead } = await supabase
     .from('leads')
-    .select('id, ai_active, name, follow_up_count, last_human_message_at, vehicle_interest, budget, payment_method, trade_in')
+    .select('id, ai_active, name, follow_up_count, last_human_message_at, vehicle_interest, budget, payment_method, trade_in, ai_paused_reason, ai_paused_until')
     .eq('store_id', store.id)
     .eq('phone', phone)
     .single()
@@ -282,17 +295,31 @@ export async function processMessage({ instance, phone, message, pushName }: Inc
     const { data: newLead } = await supabase.from('leads').upsert({
       store_id: store.id, phone, name: pushName ?? null, source: 'whatsapp', ai_active: true,
     }, { onConflict: 'store_id,phone', ignoreDuplicates: true })
-      .select('id, ai_active, name, follow_up_count, last_human_message_at, vehicle_interest, budget, payment_method, trade_in').single()
+      .select('id, ai_active, name, follow_up_count, last_human_message_at, vehicle_interest, budget, payment_method, trade_in, ai_paused_reason, ai_paused_until').single()
     lead = newLead
 
     // Se upsert retornou vazio (conflito ignorado), busca o registro existente
     if (!lead) {
       const { data: existingLead } = await supabase.from('leads')
-        .select('id, ai_active, name, follow_up_count, last_human_message_at, vehicle_interest, budget, payment_method, trade_in')
+        .select('id, ai_active, name, follow_up_count, last_human_message_at, vehicle_interest, budget, payment_method, trade_in, ai_paused_reason, ai_paused_until')
         .eq('store_id', store.id)
         .eq('phone', phone)
         .single()
       lead = existingLead
+    }
+  }
+
+  // Auto-recover: se a pausa é temporária (rate_limit) e ai_paused_until expirou, reativa.
+  if (lead && !lead.ai_active && lead.ai_paused_reason === 'rate_limit' && lead.ai_paused_until) {
+    const pausedUntil = new Date(lead.ai_paused_until as string).getTime()
+    if (Date.now() >= pausedUntil) {
+      await supabase.from('leads')
+        .update({ ai_active: true, ai_paused_reason: null, ai_paused_until: null })
+        .eq('id', lead.id)
+      lead.ai_active = true
+      lead.ai_paused_reason = null
+      lead.ai_paused_until = null
+      await logStep({ store_id: store.id, session_id: sessionId, phone, step: 'rate_limit_recovered', status: 'ok' })
     }
   }
 
@@ -323,19 +350,26 @@ export async function processMessage({ instance, phone, message, pushName }: Inc
     .gte('created_at', oneHourAgo)
 
   if ((messagesLastHour ?? 0) >= rateLimit) {
-    await logStep({ store_id: store.id, session_id: sessionId, phone, step: 'rate_limit', status: 'ok', data: { messages_last_hour: messagesLastHour, limit: rateLimit } })
+    // Pausa por 1h — auto-retoma quando ai_paused_until expirar
+    const pauseMs = 60 * 60 * 1000
+    const pausedUntil = new Date(Date.now() + pauseMs).toISOString()
+
+    await logStep({ store_id: store.id, session_id: sessionId, phone, step: 'rate_limit', status: 'ok', data: { messages_last_hour: messagesLastHour, limit: rateLimit, paused_until: pausedUntil } })
 
     // Notifica o dono da loja via WhatsApp se tiver número configurado
     if (store.notification_phone && store.whatsapp_instance) {
       await sendMessage(
         store.whatsapp_instance,
         store.notification_phone,
-        `⚠️ *Rate limit atingido*\n\nO lead *${phone}* enviou ${messagesLastHour} mensagens na última hora (limite: ${rateLimit}).\n\nO agente foi pausado para este lead. Acesse o painel para revisar.`,
+        `⚠️ *Rate limit atingido*\n\nO lead *${phone}* enviou ${messagesLastHour} mensagens na última hora (limite: ${rateLimit}).\n\nO agente foi pausado por 1 hora e será reativado automaticamente.`,
       ).catch(() => null)
     }
 
-    // Pausa IA para este lead automaticamente
-    await supabase.from('leads').update({ ai_active: false }).eq('id', lead.id)
+    await supabase.from('leads').update({
+      ai_active: false,
+      ai_paused_reason: 'rate_limit',
+      ai_paused_until: pausedUntil,
+    }).eq('id', lead.id)
     return
   }
 
@@ -347,15 +381,17 @@ export async function processMessage({ instance, phone, message, pushName }: Inc
 
   // ── 4. Histórico ──────────────────────────────────────────────────────────
   const t2 = Date.now()
-  const { data: history } = await supabase
+  const { data: historyDesc } = await supabase
     .from('agent_conversations')
     .select('role, content')
     .eq('store_id', store.id)
     .eq('phone', phone)
-    .order('created_at', { ascending: true })
+    .order('created_at', { ascending: false })
     .limit((store.agent_context_window as number | null) ?? 15)
 
-  await logStep({ store_id: store.id, session_id: sessionId, phone, step: 'history_loaded', status: 'ok', data: { messages_count: history?.length ?? 0 }, duration_ms: Date.now() - t2 })
+  const history = (historyDesc ?? []).slice().reverse()
+
+  await logStep({ store_id: store.id, session_id: sessionId, phone, step: 'history_loaded', status: 'ok', data: { messages_count: history.length }, duration_ms: Date.now() - t2 })
 
   // ── 6. RAG + Resumo do estoque ───────────────────────────────────────────
   const t3 = Date.now()
@@ -397,8 +433,13 @@ export async function processMessage({ instance, phone, message, pushName }: Inc
     lead?.trade_in ? `- Veículo para troca: ${lead.trade_in}` : '',
   ].filter(Boolean)
 
+  const resolvedAgentPrompt = applyPromptVariables(
+    (store.agent_prompt as string | null) || 'Você é um assistente de vendas especializado em veículos.',
+    store as Record<string, unknown>,
+  )
+
   const systemPrompt = [
-    store.agent_prompt || 'Você é um assistente de vendas especializado em veículos.',
+    resolvedAgentPrompt,
     TONE_INSTRUCTIONS[store.agent_tone as string] ?? '',
     `Seu nome é ${store.agent_name}. Agora são ${agora} (horário de Brasília).${pushName ? ` O cliente se chama ${pushName}.` : ''}`,
 
@@ -410,11 +451,13 @@ export async function processMessage({ instance, phone, message, pushName }: Inc
       ? `## Base de conhecimento:\n${knowledge}`
       : '',
 
-    `${stockSummary}\n\nO estoque acima é um resumo. Sempre use a função buscar_veiculos para obter detalhes completos (preço, km, opcionais) antes de apresentar um veículo específico ao cliente. Nunca invente informações de veículos.`,
+    `${stockSummary}\n\nO estoque acima é um resumo. Use a função buscar_veiculos para obter detalhes completos (preço, km, opcionais) na PRIMEIRA vez que precisar apresentar um veículo específico ao cliente. Se você já apresentou esse veículo antes nesta conversa (os detalhes estão no histórico acima), NÃO chame a função de novo nem repita as mesmas informações — apenas responda a pergunta atual do cliente e siga em frente. Nunca invente informações de veículos.`,
 
     'FOTOS — CRÍTICO: Inclua o marcador [FOTOS:marca:modelo] (ex: [FOTOS:Toyota:Corolla]) APENAS na primeira vez que apresentar um veículo na conversa. O sistema enviará as imagens automaticamente. Se o histórico já mostra que você enviou fotos desse mesmo veículo antes, NÃO repita o marcador — siga a conversa sem reenviar. Use o marcador novamente apenas se o cliente trocar de veículo de interesse ou pedir explicitamente para ver as fotos de novo. NUNCA escreva coisas como "[Enviarei as fotos]", "[Fotos do veículo]" ou qualquer texto entre colchetes que não seja um marcador oficial. Os únicos marcadores permitidos são: [FOTOS:marca:modelo], [TRANSBORDO_ATIVADO] e [CONVERSA_ENCERRADA]. FORMATO OBRIGATÓRIO: escreva exatamente [FOTOS:marca:modelo] sem espaços dentro dos colchetes (NUNCA "[ FOTOS:... ]" com espaços, NUNCA quebras de linha dentro). REGRA DE QUANTIDADE: no máximo 1 marcador [FOTOS:...] por resposta. Se apresentar 2+ veículos no mesmo turno, NÃO use marcador nenhum — apenas pergunte ao cliente qual ele quer ver, e envie as fotos só depois que ele escolher.',
 
     'Quando detectar interesse em veículo específico, orçamento, forma de pagamento ou veículo para troca, chame a função registrar_qualificacao imediatamente.',
+
+    'ORDEM CRÍTICA — QUALIFICAÇÃO: Antes de perguntar ao cliente sobre forma de pagamento, orçamento ou veículo para troca, o cliente PRECISA ter escolhido um veículo específico (ou demonstrado interesse claro em apenas um modelo). Enquanto você estiver mostrando 2+ opções, NÃO faça perguntas de qualificação — apenas pergunte qual delas ele quer ver em mais detalhes. As perguntas de pagamento/troca/orçamento só vêm no turno SEGUINTE à escolha. Exceção: se o próprio cliente já mencionou pagamento/orçamento/troca espontaneamente, registre via registrar_qualificacao normalmente (não repita a pergunta).',
 
     'Se o cliente pedir para falar com humano, responda normalmente e inclua [TRANSBORDO_ATIVADO] invisível no final.',
 
