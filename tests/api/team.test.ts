@@ -8,7 +8,7 @@ type Result = { data: unknown; error: { message: string } | null }
 
 interface MockOpts {
   authUser?: { id: string } | null
-  /** Linha de store_users encontrada na verificação de autorização (POST /invite). */
+  /** Linha de store_users encontrada na verificação de autorização (caller). */
   storeUser?: { store_id: string; role?: string } | null
   /** Linha de store_users encontrada na busca pelo membro a remover (DELETE /[id]). */
   member?: { id: string; role: string; is_active: boolean } | null
@@ -39,23 +39,18 @@ function setupMocks(opts: MockOpts = {}) {
   const chainable = ['from', 'select', 'insert', 'update', 'delete', 'eq']
   chainable.forEach(m => { adminClient[m] = vi.fn().mockReturnValue(adminClient) })
 
-  // .single() pode ser chamado em 2 contextos diferentes (invite ou delete-member).
-  // Distinguimos pelo argumento atual de from(): se for 'store_users' E o filtro
-  // de id já foi aplicado (eq 2x), é a busca de membro; caso contrário, é storeUser.
+  // .single() é chamado em sequência:
+  //   1ª — caller (store_users do user logado)
+  //   2ª — member alvo (apenas no DELETE)
   let singleCallCount = 0
   adminClient.single = vi.fn().mockImplementation(() => {
     singleCallCount += 1
-    // 1ª chamada — sempre a busca por store_user (autorização)
     if (singleCallCount === 1) {
-      // Se o teste forneceu member explicitamente, este single é o do DELETE → member
-      // Caso contrário, retorna storeUser (POST /invite)
-      // Heurística: o POST sempre passa por storeUser primeiro. Vamos definir via env do teste.
-      return Promise.resolve({
-        data: opts.member !== undefined ? member : storeUser,
-        error: opts.member !== undefined ? memberFetchError : null,
-      })
+      // Caller (autorização)
+      return Promise.resolve({ data: storeUser, error: null })
     }
-    return Promise.resolve({ data: null, error: null })
+    // 2ª chamada (DELETE): membro alvo
+    return Promise.resolve({ data: member, error: memberFetchError })
   })
 
   // Update is_active: false (delete) — caller faz await direto após eq()
@@ -168,29 +163,55 @@ describe('POST /api/team/invite', () => {
 })
 
 // ── DELETE /api/team/[id] ────────────────────────────────────────────────────
-//
-// ⚠️ ATENÇÃO: esta rota NÃO verifica autenticação e NÃO filtra por store_id da
-// loja do caller. Item registrado no BACKLOG como [alta] severidade.
-// Os testes abaixo documentam o comportamento atual; quando o bug for corrigido,
-// adicione casos para 401 (sem auth) e 403 (cross-tenant).
 
-describe('DELETE /api/team/[id] — comportamento atual', () => {
-  it('404 quando o membro não existe', async () => {
-    setupMocks({ member: null, memberFetchError: { message: 'not found' } })
+describe('DELETE /api/team/[id]', () => {
+  it('401 quando não autenticado', async () => {
+    setupMocks({ authUser: null })
     const { DELETE } = await import('@/app/api/team/[id]/route')
-    const res = await DELETE(new Request('http://x') as never, makeParams('inexistente') as never)
+    const res = await DELETE(new Request('http://x') as never, makeParams('any') as never)
+    expect(res.status).toBe(401)
+  })
+
+  it('404 quando caller não tem store_user vinculado', async () => {
+    setupMocks({ storeUser: null })
+    const { DELETE } = await import('@/app/api/team/[id]/route')
+    const res = await DELETE(new Request('http://x') as never, makeParams('any') as never)
     expect(res.status).toBe(404)
   })
 
-  it('403 quando o membro é owner (não pode ser removido)', async () => {
-    setupMocks({ member: { id: 'owner-1', role: 'owner', is_active: true } })
+  it('403 quando caller não é owner', async () => {
+    setupMocks({ storeUser: { store_id: 'store-1', role: 'staff' } })
+    const { DELETE } = await import('@/app/api/team/[id]/route')
+    const res = await DELETE(new Request('http://x') as never, makeParams('member-1') as never)
+    expect(res.status).toBe(403)
+  })
+
+  it('404 quando alvo está em OUTRA loja (anti-cross-tenant)', async () => {
+    // Caller é owner da store-1; query do membro alvo retorna null porque
+    // o filtro eq(store_id, store-1) não encontra o membro de outra loja.
+    setupMocks({
+      storeUser: { store_id: 'store-1', role: 'owner' },
+      member: null,
+      memberFetchError: { message: 'not found' },
+    })
+    const { DELETE } = await import('@/app/api/team/[id]/route')
+    const res = await DELETE(new Request('http://x') as never, makeParams('alvo-de-outra-loja') as never)
+    expect(res.status).toBe(404)
+  })
+
+  it('403 quando o membro alvo é owner (proteção contra auto-remoção)', async () => {
+    setupMocks({
+      storeUser: { store_id: 'store-1', role: 'owner' },
+      member: { id: 'owner-1', role: 'owner', is_active: true },
+    })
     const { DELETE } = await import('@/app/api/team/[id]/route')
     const res = await DELETE(new Request('http://x') as never, makeParams('owner-1') as never)
     expect(res.status).toBe(403)
   })
 
-  it('200 e soft-delete (is_active: false) para membro staff', async () => {
+  it('200 e soft-delete quando owner remove membro staff da mesma loja', async () => {
     const { adminClient } = setupMocks({
+      storeUser: { store_id: 'store-1', role: 'owner' },
       member: { id: 'staff-1', role: 'staff', is_active: true },
     })
     const { DELETE } = await import('@/app/api/team/[id]/route')
@@ -199,10 +220,12 @@ describe('DELETE /api/team/[id] — comportamento atual', () => {
     expect(res.status).toBe(200)
     expect(adminClient.update).toHaveBeenCalledWith({ is_active: false })
     expect(adminClient.eq).toHaveBeenCalledWith('id', 'staff-1')
+    expect(adminClient.eq).toHaveBeenCalledWith('store_id', 'store-1')
   })
 
-  it('500 quando o update falha', async () => {
+  it('500 quando o update final falha', async () => {
     setupMocks({
+      storeUser: { store_id: 'store-1', role: 'owner' },
       member: { id: 'staff-1', role: 'staff', is_active: true },
       updateResult: { data: null, error: { message: 'db error' } },
     })
