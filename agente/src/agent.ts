@@ -177,7 +177,7 @@ export async function enqueueMedia(params: IncomingMedia): Promise<void> {
   // Busca loja para obter API key e image prompt
   const { data: store } = await supabase
     .from('stores')
-    .select('id, openai_api_key, agent_active, whatsapp_instance, agent_image_prompt')
+    .select('id, openai_api_key, agent_active, whatsapp_instance, agent_image_prompt, openai_model')
     .eq('whatsapp_instance', params.instance)
     .single()
 
@@ -214,8 +214,11 @@ export async function enqueueMedia(params: IncomingMedia): Promise<void> {
     await logStep({ store_id: store.id, session_id: sessionId, phone: params.phone, step: 'media_download', status: 'ok', data: { bytes: base64.length } })
     try {
       const imagePrompt = (store.agent_image_prompt as string | null) || 'O cliente enviou uma imagem. Descreva o que vê e responda de forma útil no contexto de venda de veículos.'
+      // Usa o modelo da loja; cai pro gpt-4o-mini se for um modelo legado sem suporte a vision.
+      const configuredModel = (store.openai_model as string | null) || 'gpt-4o-mini'
+      const visionModel = /gpt-3\.5|^gpt-4$/i.test(configuredModel) ? 'gpt-4o-mini' : configuredModel
       const completion = await openai.chat.completions.create({
-        model: 'gpt-4o',
+        model: visionModel,
         messages: [{
           role: 'user',
           content: [
@@ -621,7 +624,9 @@ export async function processMessage({ instance, phone, message, pushName }: Inc
       if (targetPhone) {
         const clientName = lead.name ?? phone
         const notifyMsg = `🔔 Atendimento aguardando humano\n\nCliente: ${clientName}\nTelefone: ${phone}\n\nO cliente pediu para falar com um atendente.`
-        await sendMessage(store.whatsapp_instance as string, targetPhone, notifyMsg).catch(() => { /* não crítico */ })
+        await sendMessage(store.whatsapp_instance as string, targetPhone, notifyMsg).catch(async (err) => {
+          await logStep({ store_id: store.id, session_id: sessionId, phone, step: 'transbordo', status: 'error', data: { error: `falha ao notificar vendedor: ${err instanceof Error ? err.message : String(err)}` } })
+        })
         if (sp) {
           await supabase.from('leads').update({ assigned_salesperson_id: sp.id }).eq('id', lead.id)
           await logStep({ store_id: store.id, session_id: sessionId, phone, step: 'transbordo', status: 'ok', data: { assigned_to: sp.name } })
@@ -696,7 +701,9 @@ export async function processMessage({ instance, phone, message, pushName }: Inc
         const clientName = lead.name ?? phone
         const dataHora = new Date().toLocaleString('pt-BR', { timeZone: 'America/Sao_Paulo' })
         const notifyMsg = `✅ Atendimento encerrado\n\nCliente: ${clientName}\nTelefone: ${phone}\nData e hora: ${dataHora}\n\n${resumo}`
-        await sendMessage(store.whatsapp_instance as string, targetPhone, notifyMsg).catch(() => { /* não crítico */ })
+        await sendMessage(store.whatsapp_instance as string, targetPhone, notifyMsg).catch(async (err) => {
+          await logStep({ store_id: store.id, session_id: sessionId, phone, step: 'conversa_encerrada', status: 'error', data: { error: `falha ao notificar vendedor: ${err instanceof Error ? err.message : String(err)}` } })
+        })
 
         if (sp) {
           await supabase.from('leads').update({ assigned_salesperson_id: sp.id }).eq('id', lead.id)
@@ -708,8 +715,8 @@ export async function processMessage({ instance, phone, message, pushName }: Inc
 
   // ── 9. Salvar conversa ────────────────────────────────────────────────────
   await supabase.from('agent_conversations').insert([
-    { store_id: store.id, phone, role: 'user', content: message },
-    { store_id: store.id, phone, role: 'assistant', content: cleanReply, tokens_in: tokensIn, tokens_out: tokensOut },
+    { lead_id: lead?.id ?? null, store_id: store.id, phone, role: 'user', content: message },
+    { lead_id: lead?.id ?? null, store_id: store.id, phone, role: 'assistant', content: cleanReply, tokens_in: tokensIn, tokens_out: tokensOut },
   ])
 
   // ── 10 + 11. Enviar resposta + fotos intercaladas ────────────────────────
@@ -719,9 +726,40 @@ export async function processMessage({ instance, phone, message, pushName }: Inc
   const chunks = splitMessage(cleanReply, maxChars)
 
   // Fotos só quando o modelo emite o marcador [FOTOS:marca:modelo]
-  const fotosSource = fotosMatch
+  let fotosSource = fotosMatch
     ? { brand: fotosMatch[1].trim(), model: fotosMatch[2].trim() }
     : null
+
+  // Guarda no código: se já enviamos fotos do mesmo veículo recentemente e o cliente
+  // não está pedindo de novo explicitamente, suprime o envio mesmo com marcador presente.
+  if (fotosSource) {
+    const clientWantsPhotos = /\b(foto|fotos|imagem|imagens|ver|mostrar|manda|me\s+envia)\b/i.test(message)
+    if (!clientWantsPhotos) {
+      const thirtyMinAgo = new Date(Date.now() - 30 * 60 * 1000).toISOString()
+      const { data: recentPhotoLogs } = await supabase
+        .from('agent_logs')
+        .select('data')
+        .eq('store_id', store.id)
+        .eq('phone', phone)
+        .eq('step', 'photos_sent')
+        .eq('status', 'ok')
+        .gte('created_at', thirtyMinAgo)
+        .order('created_at', { ascending: false })
+        .limit(10)
+
+      const alreadySent = (recentPhotoLogs ?? []).some(l => {
+        const d = l.data as { brand?: string; model?: string } | null
+        if (!d?.brand || !d?.model || !fotosSource) return false
+        return d.brand.toLowerCase() === fotosSource.brand.toLowerCase()
+          && d.model.toLowerCase() === fotosSource.model.toLowerCase()
+      })
+
+      if (alreadySent) {
+        await logStep({ store_id: store.id, session_id: sessionId, phone, step: 'photos_skipped', status: 'ok', data: { brand: fotosSource.brand, model: fotosSource.model, reason: 'já enviadas nos últimos 30 min e cliente não pediu de novo' } })
+        fotosSource = null
+      }
+    }
+  }
 
   // Se há fotos a enviar: manda chunks iniciais → fotos → último chunk (pergunta)
   // Se não há fotos: manda todos os chunks normalmente

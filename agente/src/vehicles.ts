@@ -138,8 +138,16 @@ function vehicleToSummary(v: Vehicle): string {
   return `- ${v.brand} ${v.model}${v.version ? ' ' + v.version : ''} ${v.year_model} — ${price}`
 }
 
+// Cache do contexto de estoque por loja (TTL 60s) — evita query repetida a cada mensagem
+const stockCache = new Map<string, { content: string; expiresAt: number }>()
+const STOCK_TTL_MS = 60 * 1000
+
 /** Retorna todos os veículos disponíveis da loja formatados para injetar no system prompt */
 export async function getStockContext(storeId: string, limit = 20, format: 'full' | 'summary' = 'full'): Promise<string> {
+  const cacheKey = `${storeId}:${limit}:${format}`
+  const cached = stockCache.get(cacheKey)
+  if (cached && cached.expiresAt > Date.now()) return cached.content
+
   const { data, error } = await supabase
     .from('vehicles')
     .select('brand,model,version,year_model,color,mileage,fuel,transmission,price,price_negotiable,features,description')
@@ -149,15 +157,17 @@ export async function getStockContext(storeId: string, limit = 20, format: 'full
     .order('created_at', { ascending: false })
     .limit(limit)
 
+  let content: string
   if (error || !data || data.length === 0) {
-    return 'Nenhum veículo disponível no estoque no momento.'
-  }
-
-  if (format === 'summary') {
+    content = 'Nenhum veículo disponível no estoque no momento.'
+  } else if (format === 'summary') {
     const items = (data as Vehicle[]).map(vehicleToSummary).join('\n')
-    return `## Estoque atual (${data.length} veículo(s) disponíveis):\n${items}\n\nQuando o cliente pedir detalhes de UM veículo específico, apresente todas as informações disponíveis sobre ele.`
+    content = `## Estoque atual (${data.length} veículo(s) disponíveis):\n${items}\n\nQuando o cliente pedir detalhes de UM veículo específico, apresente todas as informações disponíveis sobre ele.`
+  } else {
+    const items = (data as Vehicle[]).map(vehicleToText).join('\n\n')
+    content = `## Estoque atual (${data.length} veículo(s) disponíveis):\n\n${items}`
   }
 
-  const items = (data as Vehicle[]).map(vehicleToText).join('\n\n')
-  return `## Estoque atual (${data.length} veículo(s) disponíveis):\n\n${items}`
+  stockCache.set(cacheKey, { content, expiresAt: Date.now() + STOCK_TTL_MS })
+  return content
 }
